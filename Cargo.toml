@@ -1,0 +1,16 @@
+[package]
+name = "po-missing"
+version = "0.1.0"
+edition = "2024"
+description = "Extract missing translations from PO files"
+license = "MIT"
+repository = "https://github.com/yourusername/po-missing"
+readme = "README.md"
+
+[dependencies]
+rspolib = "0.1"  # Use the actual version you need
+clap = { version = "4.5", features = ["derive"] }
+anyhow = "1.0"
+
+[dev-dependencies]
+tempfile = "3.8"
