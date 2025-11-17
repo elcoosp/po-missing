@@ -87,9 +87,113 @@ fn process_locale(base_path: &str, locale: &str, verbose: bool) -> Result<()> {
         return Ok(()); // Skip if no messages.po exists
     }
 
-    let main_po = pofile(messages_path.as_path())
-        .map_err(|e| anyhow::anyhow!("Failed to read {}: {}", messages_path.display(), e))?;
+    // First, check if there's a messages-missing.po with non-empty translations to merge back
+    if messages_missing_path.exists() {
+        if let Ok(missing_po) = pofile(messages_missing_path.as_path()) {
+            let mut main_po = pofile(messages_path.as_path()).map_err(|e| {
+                anyhow::anyhow!("Failed to read {}: {}", messages_path.display(), e)
+            })?;
 
+            let mut updated_count = 0;
+            let mut has_non_empty_translations = false;
+
+            // Look for entries in messages-missing.po that have non-empty translations
+            for missing_entry in &missing_po.entries {
+                // Skip the header entry (empty msgid)
+                if missing_entry.msgid.is_empty() {
+                    continue;
+                }
+
+                // Check if this entry has a non-empty translation in messages-missing.po
+                if let Some(msgstr) = &missing_entry.msgstr {
+                    if !msgstr.trim().is_empty() {
+                        has_non_empty_translations = true;
+
+                        // Find the corresponding entry in the main PO file
+                        if let Some(main_entry) = main_po.entries.iter_mut().find(|e| {
+                            e.msgid == missing_entry.msgid && e.msgctxt == missing_entry.msgctxt
+                        }) {
+                            // Update the translation in the main PO file
+                            main_entry.msgstr = Some(msgstr.clone());
+                            updated_count += 1;
+                        }
+                    }
+                }
+            }
+
+            // If we found non-empty translations, save the updated main PO file
+            if has_non_empty_translations {
+                main_po.save(messages_path.as_os_str().to_str().unwrap());
+
+                if verbose {
+                    println!(
+                        "  🔄 {}: {} translations merged back from messages-missing.po",
+                        locale, updated_count
+                    );
+                }
+
+                // After merging, we can remove the messages-missing.po file
+                fs::remove_file(&messages_missing_path)?;
+
+                // Re-read the main PO file for the next steps since we just updated it
+                let main_po = pofile(messages_path.as_path()).map_err(|e| {
+                    anyhow::anyhow!("Failed to read {}: {}", messages_path.display(), e)
+                })?;
+
+                // Continue to extract current missing translations
+                extract_current_missing(
+                    &main_po,
+                    &messages_path,
+                    &messages_missing_path,
+                    locale,
+                    verbose,
+                )?;
+            } else {
+                // No non-empty translations found, proceed with normal extraction
+                extract_current_missing(
+                    &main_po,
+                    &messages_path,
+                    &messages_missing_path,
+                    locale,
+                    verbose,
+                )?;
+            }
+        } else {
+            // If we can't read messages-missing.po, just proceed with normal extraction
+            let main_po = pofile(messages_path.as_path()).map_err(|e| {
+                anyhow::anyhow!("Failed to read {}: {}", messages_path.display(), e)
+            })?;
+            extract_current_missing(
+                &main_po,
+                &messages_path,
+                &messages_missing_path,
+                locale,
+                verbose,
+            )?;
+        }
+    } else {
+        // No messages-missing.po exists, proceed with normal extraction
+        let main_po = pofile(messages_path.as_path())
+            .map_err(|e| anyhow::anyhow!("Failed to read {}: {}", messages_path.display(), e))?;
+        extract_current_missing(
+            &main_po,
+            &messages_path,
+            &messages_missing_path,
+            locale,
+            verbose,
+        )?;
+    }
+
+    Ok(())
+}
+
+fn extract_current_missing(
+    main_po: &POFile,
+    messages_path: &PathBuf,
+    messages_missing_path: &PathBuf,
+    locale: &str,
+    verbose: bool,
+) -> Result<()> {
     // Create options for new PO file
     let empty_opts = FileOptions {
         path_or_content: "".into(),
