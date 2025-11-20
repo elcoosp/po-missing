@@ -350,12 +350,6 @@ fn translate_locale(
 }
 
 fn initialize_ollama(ollama_url: &str) -> Result<Ollama> {
-    // Parse the URL to extract host and port
-    // Bug called `Result::unwrap()` on an `Err` value: RelativeUrlWithoutBase
-    // let url = url::Url::parse(ollama_url).context("Failed to parse Ollama URL")?;
-    // let host = ollama_url.split(":").collect::<Vec<_>>()[0];
-    // let port = url.port().unwrap_or(11434);
-
     Ok(Ollama::default())
 }
 
