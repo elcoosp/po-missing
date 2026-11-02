@@ -1,19 +1,29 @@
 [package]
 name = "po-missing"
-version = "0.1.0"
+version = "0.2.0"
 edition = "2024"
-description = "Extract missing translations from PO files & AI translate then merge-back"
+rust-version = "1.85"
+description = "Extract missing translations from PO files and merge completed ones back"
 license = "MIT"
-repository = "https://github.com/yourusername/po-missing"
+repository = "https://github.com/elcoosp/po-missing"
 readme = "README.md"
+keywords = ["i18n", "gettext", "po", "translation", "cli"]
+categories = ["command-line-utilities", "internationalization", "localization"]
 
 [dependencies]
-anyhow = "1.0"
-clap = { version = "4.5", features = ["derive"] }
-rspolib = "0.1"
-serde = { version = "1.0", features = ["derive"] }
-serde_json = "1.0"
-reqwest = { version = "0.12", features = ["blocking", "json"] }
-ollama-rs = "0.3"
-tokio = { version = "1.0", features = ["rt-multi-thread", "macros"] }
-url = "2.4"
+clap = { version = "4.6.7", features = ["derive"] }
+rspolib = "0.1.2"
+serde = { version = "1.0.229", features = ["derive"] }
+serde_json = "1.0.154"
+thiserror = "2.0.21"
+
+[dev-dependencies]
+tempfile = "3.27.0"
+
+[lints.rust]
+unsafe_code = "forbid"
+missing_docs = "warn"
+
+[lints.clippy]
+pedantic = { level = "warn", priority = -1 }
+nursery = { level = "warn", priority = -1 }
