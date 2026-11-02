@@ -1,417 +1,206 @@
-use anyhow::{Context, Result};
-use clap::Parser;
-use ollama_rs::Ollama;
-use ollama_rs::generation::completion::request::GenerationRequest;
-use rspolib::{FileOptions, POFile, Save, pofile};
-use serde::{Deserialize, Serialize};
-use std::fs;
-use std::path::{Path, PathBuf};
+//! CLI entry point: parse arguments, run the engine, render output.
+//!
+//! All rendering lives in functions so the unit tests can exercise it
+//! directly; the integration tests in `tests/` drive the real binary.
 
-#[derive(Parser)]
-#[command(
-    name = "po-translate",
-    version = "0.2.0",
-    author = "elcoosp",
-    about = "Extract and translate missing translations from PO files",
-    long_about = "Scans locale directories for PO files, extracts missing translations, and optionally uses Ollama to generate translations"
-)]
-struct Cli {
-    /// Base directory containing locale folders
-    #[arg(short, long, default_value = "frontend/src/locales")]
-    base_path: String,
+mod cli;
 
-    /// Enable verbose output
-    #[arg(short, long)]
-    verbose: bool,
+use std::fmt::Write as _;
+use std::process::ExitCode;
 
-    /// Ollama model to use for translations (e.g., "llama3.2", "mistral")
-    #[arg(short, long)]
-    model: Option<String>,
+use clap::Parser as _;
 
-    /// Ollama API endpoint
-    #[arg(long, default_value = "http://localhost:11434")]
-    ollama_url: String,
+use cli::Cli;
+use po_missing::{LocaleOutcome, MissingFileAction, Summary};
 
-    /// Source locale for reference (default: en)
-    #[arg(short, long, default_value = "en")]
-    source_locale: String,
-}
-
-fn main() -> Result<()> {
+fn main() -> ExitCode {
     let cli = Cli::parse();
-
-    if cli.verbose {
-        println!("Scanning for locales in '{}' directory...", cli.base_path);
-        if let Some(ref model) = cli.model {
-            println!("Using Ollama model: {}", model);
+    let options = cli.options();
+    let summary = match po_missing::run(&options) {
+        Ok(summary) => summary,
+        Err(error) => {
+            eprintln!("error: {error}");
+            return ExitCode::FAILURE;
         }
+    };
+    if cli.is_json() {
+        println!("{}", json_summary(&summary));
+    } else if !cli.is_quiet() {
+        print!("{}", text_summary(&summary, cli.is_verbose()));
     }
-
-    process_translations(&cli)
+    exit_code(&summary, cli.fail_on_missing())
 }
 
-fn process_translations(cli: &Cli) -> Result<()> {
-    let locales_dir = Path::new(&cli.base_path);
-    if !locales_dir.exists() {
-        anyhow::bail!("Directory '{}' does not exist", cli.base_path);
+/// Map a run summary to the documented exit code.
+///
+/// * `0` — success;
+/// * `1` — at least one locale failed;
+/// * `2` — `--fail-on-missing` was requested and missing translations remain.
+fn exit_code(summary: &Summary, fail_on_missing: bool) -> ExitCode {
+    if summary.failed > 0 {
+        ExitCode::FAILURE
+    } else if fail_on_missing && summary.missing > 0 {
+        ExitCode::from(2)
+    } else {
+        ExitCode::SUCCESS
     }
-
-    // Step 1: Extract missing translations for all locales
-    if cli.verbose {
-        println!("\n📋 Phase 1: Extracting missing translations...");
-    }
-    extract_missing_translations(&cli.base_path, cli.verbose)?;
-
-    // Step 2: If model is specified, translate missing entries
-    if let Some(ref model) = cli.model {
-        if cli.verbose {
-            println!("\n🤖 Phase 2: Translating with Ollama...");
-        }
-        translate_with_ollama(cli)?;
-    }
-
-    Ok(())
 }
 
-fn extract_missing_translations(base_path: &str, verbose: bool) -> Result<()> {
-    let locales_dir = Path::new(base_path);
-    let mut processed = 0;
-    let mut errors = 0;
-
-    for entry in fs::read_dir(locales_dir)
-        .with_context(|| format!("Failed to read directory '{}'", base_path))?
-    {
-        let entry = entry?;
-        let path = entry.path();
-
-        if path.is_dir() {
-            if let Some(locale) = path.file_name().and_then(|name| name.to_str()) {
-                match process_locale(base_path, locale, verbose) {
-                    Ok(_) => processed += 1,
-                    Err(e) => {
-                        eprintln!("Error processing locale '{}': {}", locale, e);
-                        errors += 1;
-                    }
-                }
+/// Human-readable report (per-locale lines only in verbose mode).
+fn text_summary(summary: &Summary, verbose: bool) -> String {
+    let mut out = String::new();
+    for result in &summary.results {
+        match &result.outcome {
+            LocaleOutcome::Processed { stats } if verbose => {
+                let missing_note = match stats.missing_file {
+                    MissingFileAction::Written => format!(", {} missing extracted", stats.missing),
+                    MissingFileAction::Removed => String::from(", missing file removed"),
+                    MissingFileAction::None => String::new(),
+                };
+                let _ = writeln!(
+                    out,
+                    "  ✅ {}: {:.1}% translated, {} merged, {} orphaned{missing_note}",
+                    result.locale, stats.percent, stats.merged, stats.orphaned
+                );
             }
+            LocaleOutcome::Skipped if verbose => {
+                let _ = writeln!(out, "  ⏭️  {}: no messages file, skipped", result.locale);
+            }
+            LocaleOutcome::Failed { error } => {
+                let _ = writeln!(out, "  ❌ {}: {error}", result.locale);
+            }
+            LocaleOutcome::Processed { .. } | LocaleOutcome::Skipped => {}
+        }
+    }
+    let _ = writeln!(
+        out,
+        "{} locale(s) processed, {} skipped, {} merged, {} missing, {} error(s)",
+        summary.processed, summary.skipped, summary.merged, summary.missing, summary.failed
+    );
+    out
+}
+
+/// Machine-readable JSON report.
+fn json_summary(summary: &Summary) -> String {
+    serde_json::to_string(summary).unwrap_or_default()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{exit_code, json_summary, text_summary};
+    use po_missing::{LocaleOutcome, LocaleResult, LocaleStats, MissingFileAction, Summary};
+    use std::process::ExitCode;
+
+    fn stats(missing: usize, merged: usize) -> LocaleStats {
+        let translated = u32::try_from(10 - missing).unwrap_or(u32::MAX);
+        LocaleStats {
+            total: 10,
+            translated: 10 - missing,
+            missing,
+            percent: f64::from(translated) * 10.0,
+            merged,
+            orphaned: 0,
+            missing_file: if missing > 0 {
+                MissingFileAction::Written
+            } else {
+                MissingFileAction::None
+            },
         }
     }
 
-    if verbose {
-        println!(
-            "✅ Extraction complete: {} locales processed, {} errors",
-            processed, errors
+    fn summary(results: Vec<LocaleResult>) -> Summary {
+        Summary::new(results)
+    }
+
+    #[test]
+    fn text_summary_verbose_lists_locales() {
+        let summary = summary(vec![LocaleResult {
+            locale: String::from("fr"),
+            outcome: LocaleOutcome::Processed { stats: stats(3, 1) },
+        }]);
+        let text = text_summary(&summary, true);
+        assert!(
+            text.contains("✅ fr: 70.0% translated, 1 merged, 0 orphaned, 3 missing extracted")
+        );
+        assert!(
+            text.ends_with("1 locale(s) processed, 0 skipped, 1 merged, 3 missing, 0 error(s)\n")
         );
     }
 
-    if errors > 0 {
-        anyhow::bail!("Completed with {} errors", errors);
+    #[test]
+    fn text_summary_quiet_only_prints_the_recap() {
+        let summary = summary(vec![LocaleResult {
+            locale: String::from("fr"),
+            outcome: LocaleOutcome::Processed { stats: stats(0, 0) },
+        }]);
+        let text = text_summary(&summary, false);
+        assert!(!text.contains("✅"));
+        assert!(text.contains("0 missing"));
     }
 
-    Ok(())
-}
-
-fn process_locale(base_path: &str, locale: &str, verbose: bool) -> Result<()> {
-    let messages_path = PathBuf::from(base_path).join(locale).join("messages.po");
-    let messages_missing_path = PathBuf::from(base_path)
-        .join(locale)
-        .join("messages-missing.po");
-
-    if !messages_path.exists() {
-        return Ok(());
+    #[test]
+    fn text_summary_reports_removed_missing_file_and_skips() {
+        let mut clean = stats(0, 0);
+        clean.missing_file = MissingFileAction::Removed;
+        let summary = summary(vec![
+            LocaleResult {
+                locale: String::from("en"),
+                outcome: LocaleOutcome::Processed { stats: clean },
+            },
+            LocaleResult {
+                locale: String::from("zz"),
+                outcome: LocaleOutcome::Skipped,
+            },
+            LocaleResult {
+                locale: String::from("broken"),
+                outcome: LocaleOutcome::Failed {
+                    error: String::from("boom"),
+                },
+            },
+        ]);
+        let text = text_summary(&summary, true);
+        assert!(text.contains("missing file removed"));
+        assert!(text.contains("⏭️  zz: no messages file, skipped"));
+        assert!(text.contains("❌ broken: boom"));
+        assert!(text.contains("1 skipped"));
     }
 
-    // Merge back any completed translations from messages-missing.po
-    if messages_missing_path.exists() {
-        merge_back_translations(&messages_path, &messages_missing_path, locale, verbose)?;
+    #[test]
+    fn json_summary_is_valid_and_complete() {
+        let summary = summary(vec![LocaleResult {
+            locale: String::from("fr"),
+            outcome: LocaleOutcome::Processed { stats: stats(2, 4) },
+        }]);
+        let json = json_summary(&summary);
+        let parsed: serde_json::Value = serde_json::from_str(&json).expect("valid json");
+        assert_eq!(parsed["results"][0]["locale"], "fr");
+        assert_eq!(parsed["results"][0]["status"], "processed");
+        assert_eq!(parsed["results"][0]["missing"], 2);
+        assert_eq!(parsed["results"][0]["merged"], 4);
+        assert_eq!(parsed["results"][0]["missing_file"], "written");
+        assert_eq!(parsed["processed"], 1);
     }
 
-    // Extract current missing translations
-    let main_po = pofile(messages_path.as_path())
-        .map_err(|e| anyhow::anyhow!("Failed to read {}: {}", messages_path.display(), e))?;
-
-    extract_current_missing(&main_po, &messages_missing_path, locale, verbose)?;
-
-    Ok(())
-}
-
-fn merge_back_translations(
-    messages_path: &PathBuf,
-    messages_missing_path: &PathBuf,
-    locale: &str,
-    verbose: bool,
-) -> Result<()> {
-    let missing_po = pofile(messages_missing_path.as_path())?;
-    let mut main_po = pofile(messages_path.as_path())
-        .map_err(|e| anyhow::anyhow!("Failed to read {}: {}", messages_path.display(), e))?;
-
-    let mut updated_count = 0;
-
-    for missing_entry in &missing_po.entries {
-        if missing_entry.msgid.is_empty() {
-            continue;
-        }
-
-        if let Some(msgstr) = &missing_entry.msgstr {
-            if !msgstr.trim().is_empty() {
-                if let Some(main_entry) = main_po
-                    .entries
-                    .iter_mut()
-                    .find(|e| e.msgid == missing_entry.msgid && e.msgctxt == missing_entry.msgctxt)
-                {
-                    main_entry.msgstr = Some(msgstr.clone());
-                    updated_count += 1;
-                }
-            }
-        }
-    }
-
-    if updated_count > 0 {
-        main_po.save(messages_path.as_os_str().to_str().unwrap());
-        if verbose {
-            println!(
-                "  🔄 {}: {} translations merged back",
-                locale, updated_count
-            );
-        }
-        fs::remove_file(messages_missing_path)?;
-    }
-
-    Ok(())
-}
-
-fn extract_current_missing(
-    main_po: &POFile,
-    messages_missing_path: &PathBuf,
-    locale: &str,
-    verbose: bool,
-) -> Result<()> {
-    let empty_opts = FileOptions {
-        path_or_content: "".into(),
-        wrapwidth: 0,
-        byte_content: None,
-    };
-
-    let mut new_missing_po = POFile::new(empty_opts);
-
-    // Copy header
-    if let Some(header_entry) = main_po.entries.iter().find(|e| e.msgid.is_empty()) {
-        new_missing_po.entries.push(header_entry.clone());
-    }
-
-    let mut missing_count = 0;
-    for entry in &main_po.entries {
-        if entry.msgid.is_empty() {
-            continue;
-        }
-
-        let is_missing = match &entry.msgstr {
-            None => true,
-            Some(s) => s.trim().is_empty(),
-        };
-
-        if is_missing {
-            new_missing_po.entries.push(entry.clone());
-            missing_count += 1;
-        }
-    }
-
-    if missing_count > 0 {
-        new_missing_po.save(messages_missing_path.as_os_str().to_str().unwrap());
-        if verbose {
-            println!(
-                "  ✅ {}: {} missing translations extracted",
-                locale, missing_count
-            );
-        }
-    } else {
-        if messages_missing_path.exists() {
-            fs::remove_file(messages_missing_path)?;
-        }
-        if verbose {
-            println!("  ✅ {}: no missing translations", locale);
-        }
-    }
-
-    Ok(())
-}
-
-fn translate_with_ollama(cli: &Cli) -> Result<()> {
-    let locales_dir = Path::new(&cli.base_path);
-    let model = cli.model.as_ref().unwrap();
-
-    for entry in fs::read_dir(locales_dir)? {
-        let entry = entry?;
-        let path = entry.path();
-
-        if !path.is_dir() {
-            continue;
-        }
-
-        let locale = match path.file_name().and_then(|name| name.to_str()) {
-            Some(l) => l,
-            None => continue,
-        };
-
-        // Skip source locale
-        if locale == cli.source_locale {
-            continue;
-        }
-
-        let messages_missing_path = path.join("messages-missing.po");
-        if !messages_missing_path.exists() {
-            continue;
-        }
-
-        if cli.verbose {
-            println!("\n🌐 Translating {} locale...", locale);
-        }
-
-        translate_locale(
-            &messages_missing_path,
-            locale,
-            model,
-            &cli.ollama_url,
-            cli.verbose,
-        )?;
-
-        // After translation, merge back the translations
-        let messages_path = path.join("messages.po");
-        merge_back_translations(&messages_path, &messages_missing_path, locale, cli.verbose)?;
-    }
-
-    Ok(())
-}
-
-fn translate_locale(
-    messages_missing_path: &PathBuf,
-    locale: &str,
-    model: &str,
-    ollama_url: &str,
-    verbose: bool,
-) -> Result<()> {
-    let mut missing_po = pofile(messages_missing_path.as_path())?;
-
-    let entries_needing_translation: Vec<(usize, String)> = missing_po
-        .entries
-        .iter()
-        .enumerate()
-        .filter(|(_, entry)| {
-            entry.msgid.is_empty() == false
-                && entry
-                    .msgstr
-                    .as_ref()
-                    .map(|s| s.trim().is_empty())
-                    .unwrap_or(true)
-        })
-        .map(|(idx, entry)| (idx, entry.msgid.clone()))
-        .collect();
-
-    let total = entries_needing_translation.len();
-    let mut translated_count = 0;
-
-    // Initialize Ollama client
-    let ollama = initialize_ollama(ollama_url)?;
-
-    for (idx, msgid) in entries_needing_translation {
-        if verbose {
-            println!(
-                "  Translating {}/{}: {}",
-                translated_count + 1,
-                total,
-                msgid
-            );
-        }
-
-        match call_ollama(&ollama, &msgid, locale, model) {
-            Ok(translation) => {
-                missing_po.entries[idx].msgstr = Some(translation);
-                translated_count += 1;
-            }
-            Err(e) => {
-                eprintln!("  ❌ Failed to translate '{}': {}", msgid, e);
-                // Continue with next translation instead of failing completely
-                continue;
-            }
-        }
-    }
-
-    if translated_count > 0 {
-        missing_po.save(messages_missing_path.as_os_str().to_str().unwrap());
-        if verbose {
-            println!(
-                "  ✅ {}: {} translations completed",
-                locale, translated_count
-            );
-        }
-    }
-
-    Ok(())
-}
-
-fn initialize_ollama(ollama_url: &str) -> Result<Ollama> {
-    Ok(Ollama::default())
-}
-
-fn call_ollama(ollama: &Ollama, text: &str, target_locale: &str, model: &str) -> Result<String> {
-    let locale_name = get_locale_name(target_locale);
-
-    let prompt = format!(
-        r#"Translate the following text to {locale_name} ({target_locale}).
-Provide ONLY the translation, without any explanation, quotes, or additional text.
-Do not include phrases like "Here is the translation:" or similar.
-
-Text to translate: {text}
-
-Translation:"#,
-        locale_name = locale_name,
-        target_locale = target_locale,
-        text = text
-    );
-
-    // Use tokio runtime to call async ollama-rs
-    let runtime = tokio::runtime::Runtime::new().context("Failed to create tokio runtime")?;
-
-    let response = runtime
-        .block_on(async {
-            ollama
-                .generate(GenerationRequest::new(model.to_string(), prompt))
-                .await
-        })
-        .context("Failed to call Ollama API")?;
-
-    Ok(response.response.trim().to_string())
-}
-
-fn get_locale_name(locale: &str) -> &str {
-    match locale {
-        "fr" | "fr_FR" => "French",
-        "es" | "es_ES" => "Spanish",
-        "de" | "de_DE" => "German",
-        "it" | "it_IT" => "Italian",
-        "pt" | "pt_PT" => "Portuguese",
-        "pt_BR" => "Brazilian Portuguese",
-        "ja" | "ja_JP" => "Japanese",
-        "zh" | "zh_CN" => "Chinese (Simplified)",
-        "zh_TW" => "Chinese (Traditional)",
-        "ko" | "ko_KR" => "Korean",
-        "ru" | "ru_RU" => "Russian",
-        "ar" | "ar_SA" => "Arabic",
-        "nl" | "nl_NL" => "Dutch",
-        "pl" | "pl_PL" => "Polish",
-        "sv" | "sv_SE" => "Swedish",
-        "da" | "da_DK" => "Danish",
-        "no" | "nb_NO" => "Norwegian",
-        "fi" | "fi_FI" => "Finnish",
-        "tr" | "tr_TR" => "Turkish",
-        "cs" | "cs_CZ" => "Czech",
-        "hu" | "hu_HU" => "Hungarian",
-        "ro" | "ro_RO" => "Romanian",
-        "el" | "el_GR" => "Greek",
-        "th" | "th_TH" => "Thai",
-        "vi" | "vi_VN" => "Vietnamese",
-        "id" | "id_ID" => "Indonesian",
-        "uk" | "uk_UA" => "Ukrainian",
-        _ => locale,
+    #[test]
+    fn exit_codes_follow_the_contract() {
+        let clean = summary(vec![LocaleResult {
+            locale: String::from("fr"),
+            outcome: LocaleOutcome::Processed { stats: stats(0, 0) },
+        }]);
+        let dirty = summary(vec![LocaleResult {
+            locale: String::from("fr"),
+            outcome: LocaleOutcome::Processed { stats: stats(5, 0) },
+        }]);
+        let failed = summary(vec![LocaleResult {
+            locale: String::from("fr"),
+            outcome: LocaleOutcome::Failed {
+                error: String::from("boom"),
+            },
+        }]);
+        assert_eq!(exit_code(&clean, false), ExitCode::SUCCESS);
+        assert_eq!(exit_code(&clean, true), ExitCode::SUCCESS);
+        assert_eq!(exit_code(&dirty, false), ExitCode::SUCCESS);
+        assert_eq!(exit_code(&dirty, true), ExitCode::from(2));
+        assert_eq!(exit_code(&failed, false), ExitCode::FAILURE);
     }
 }
